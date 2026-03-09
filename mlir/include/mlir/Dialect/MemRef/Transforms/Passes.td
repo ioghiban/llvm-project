@@ -11,6 +11,17 @@
 
 include "mlir/Pass/PassBase.td"
 
+def ElideReinterpretCastPass : Pass<"memref-elide-reinterpret-cast"> {
+  let summary = "Replace ops depending on redundant reinterpret_cast(s) to be "
+                "convertible to EmitC.";
+  let description = [{
+  Replace ops that move data and depend on redundant memref.reinterpret_cast(s)
+  to provide compatible shapes with other ops that achieve similar data movement,
+  without requiring memref.reinterpret_cast(s). This helps simplify the conversion
+  to EmitC.";
+}];
+}
+
 def ExpandOpsPass : Pass<"memref-expand"> {
   let summary = "Legalize memref operations to be convertible to LLVM.";
 }

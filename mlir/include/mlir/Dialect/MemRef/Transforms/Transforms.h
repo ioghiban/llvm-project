@@ -39,6 +39,10 @@ class DeallocOp;
 // Patterns
 //===----------------------------------------------------------------------===//
 
+/// Collects a set of patterns to rewrite ops removing redundant reinterpret
+/// casts within the memref dialect.
+void populateElideReinterpretCastPatterns(RewritePatternSet &patterns);
+
 /// Collects a set of patterns to rewrite ops within the memref dialect.
 void populateExpandOpsPatterns(RewritePatternSet &patterns);
 
