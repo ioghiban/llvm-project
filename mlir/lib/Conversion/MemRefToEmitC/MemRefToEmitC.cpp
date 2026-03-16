@@ -140,6 +140,41 @@ createPointerFromEmitcArray(Location loc, OpBuilder &builder,
   return ptr;
 }
 
+static Value stripPointerUnrealizedCast(Value v) {
+  if (auto cast = v.getDefiningOp<UnrealizedConversionCastOp>())
+    if (cast.getNumOperands() == 1 &&
+        isa<emitc::PointerType>(cast.getOperand(0).getType()))
+      return cast.getOperand(0); // Pointer path
+  return Value();                // Array path
+}
+
+static Value computeRowMajorLinearIndex(Location loc, MemRefType memrefType,
+                                        ValueRange indices,
+                                        OpBuilder &builder) {
+  ArrayRef<int64_t> shape = memrefType.getShape();
+
+  Type idxType =
+      indices.empty() ? builder.getIndexType() : indices[0].getType();
+
+  Value linearIndex = indices.empty()
+                          ? emitc::ConstantOp::create(builder, loc, idxType,
+                                                      builder.getIndexAttr(0))
+                          : indices[0];
+
+  for (size_t i = 1; i < shape.size(); ++i) {
+    Value dimSize = emitc::ConstantOp::create(builder, loc, idxType,
+                                              builder.getIndexAttr(shape[i]));
+
+    linearIndex =
+        emitc::MulOp::create(builder, loc, idxType, linearIndex, dimSize);
+
+    linearIndex =
+        emitc::AddOp::create(builder, loc, idxType, linearIndex, indices[i]);
+  }
+
+  return linearIndex;
+}
+
 struct ConvertAlloc final : public OpConversionPattern<memref::AllocOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
@@ -347,15 +382,32 @@ struct ConvertLoad final : public OpConversionPattern<memref::LoadOp> {
 
     auto arrayValue =
         dyn_cast<TypedValue<emitc::ArrayType>>(operands.getMemref());
-    if (!arrayValue) {
-      return rewriter.notifyMatchFailure(op.getLoc(), "expected array type");
+    Value strippedPtr = stripPointerUnrealizedCast(operands.getMemref());
+    if (!strippedPtr && arrayValue) {
+      auto subscript = emitc::SubscriptOp::create(
+          rewriter, op.getLoc(), arrayValue, operands.getIndices());
+
+      rewriter.replaceOpWithNewOp<emitc::LoadOp>(op, resultTy, subscript);
+      return success();
     }
+    if (strippedPtr) {
+      Location loc = op.getLoc();
+      MemRefType opMemrefType = cast<MemRefType>(op.getMemref().getType());
+      ValueRange indices = operands.getIndices();
 
-    auto subscript = emitc::SubscriptOp::create(
-        rewriter, op.getLoc(), arrayValue, operands.getIndices());
+      // Compute row-major linear index
+      Value linearIndex =
+          computeRowMajorLinearIndex(loc, opMemrefType, indices, rewriter);
 
-    rewriter.replaceOpWithNewOp<emitc::LoadOp>(op, resultTy, subscript);
-    return success();
+      auto typedPtr = cast<TypedValue<emitc::PointerType>>(strippedPtr);
+      auto subscript = emitc::SubscriptOp::create(rewriter, op.getLoc(),
+                                                  typedPtr, linearIndex);
+
+      rewriter.replaceOpWithNewOp<emitc::LoadOp>(op, resultTy, subscript);
+      return success();
+    }
+    return rewriter.notifyMatchFailure(op.getLoc(),
+                                       "expected array or pointer type");
   }
 };
 
@@ -367,17 +419,36 @@ struct ConvertStore final : public OpConversionPattern<memref::StoreOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto arrayValue =
         dyn_cast<TypedValue<emitc::ArrayType>>(operands.getMemref());
-    if (!arrayValue) {
-      return rewriter.notifyMatchFailure(op.getLoc(), "expected array type");
+    Value strippedPtr = stripPointerUnrealizedCast(operands.getMemref());
+    if (!strippedPtr && arrayValue) {
+      auto subscript = emitc::SubscriptOp::create(
+          rewriter, op.getLoc(), arrayValue, operands.getIndices());
+      rewriter.replaceOpWithNewOp<emitc::AssignOp>(op, subscript,
+                                                   operands.getValue());
+      return success();
     }
 
-    auto subscript = emitc::SubscriptOp::create(
-        rewriter, op.getLoc(), arrayValue, operands.getIndices());
-    rewriter.replaceOpWithNewOp<emitc::AssignOp>(op, subscript,
-                                                 operands.getValue());
-    return success();
+    if (strippedPtr) {
+      Location loc = op.getLoc();
+      MemRefType opMemrefType = cast<MemRefType>(op.getMemref().getType());
+      ValueRange indices = operands.getIndices();
+
+      // Compute row-major linear index
+      Value linearIndex =
+          computeRowMajorLinearIndex(loc, opMemrefType, indices, rewriter);
+      auto typedPtr = cast<TypedValue<emitc::PointerType>>(strippedPtr);
+      auto subscript =
+          emitc::SubscriptOp::create(rewriter, loc, typedPtr, linearIndex);
+
+      rewriter.replaceOpWithNewOp<emitc::AssignOp>(op, subscript,
+                                                   operands.getValue());
+      return success();
+    }
+    return rewriter.notifyMatchFailure(op.getLoc(),
+                                       "expected array or pointer type");
   }
 };
+
 } // namespace
 
 void mlir::populateMemRefToEmitCTypeConversion(TypeConverter &typeConverter) {
