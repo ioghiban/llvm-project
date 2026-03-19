@@ -103,19 +103,10 @@ static bool isScalarSlice(memref::ReinterpretCastOp rc) {
       return false;
   }
 
-  int nonUnitDim = -1;
-
-  for (unsigned i = 0; i < srcRank; ++i) {
-    int64_t underlyingDim = rcInputTy.getDimSize(i);
-
-    // Must have at most one non-unit dimension
-    if (underlyingDim != 1) {
-      if (nonUnitDim != -1)
-        return false;
-      nonUnitDim = i;
-    }
-  }
-  return true;
+  int nonUnitCount =
+      std::count_if(rcInputTy.getShape().begin(), rcInputTy.getShape().end(),
+                    [](int dim) { return dim != 1; });
+  return nonUnitCount == 1;
 }
 
 /// Rewrites `memref.copy` of a 1-element MemRef as a scalar load-store pair
@@ -191,7 +182,8 @@ public:
     unsigned offsetDim = dstType.getDimSize(0) == 1 ? dstRank - 1 : 0;
     SmallVector<Value> storeIndices(dstRank, zero);
     storeIndices[offsetDim] = storeOffset;
-
+    // If the only user of `rc` is the current Op (which is about to be erased),
+    // we can safely erase it.
     if (rcOutput.hasOneUse())
       rewriter.eraseOp(rc);
 

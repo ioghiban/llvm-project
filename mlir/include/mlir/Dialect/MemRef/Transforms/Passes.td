@@ -15,10 +15,9 @@ def ElideReinterpretCastPass : Pass<"memref-elide-reinterpret-cast"> {
   let summary = "Replace ops depending on redundant reinterpret_cast(s) to be "
                 "convertible to EmitC.";
   let description = [{
-  Replace ops that move data and depend on redundant memref.reinterpret_cast(s)
-  to provide compatible shapes with other ops that achieve similar data movement,
-  without requiring memref.reinterpret_cast(s). This helps simplify the conversion
-  to EmitC.";
+    Replace data-movement ops that depend on redundant memref.reinterpret_cast
+    operations to obtain compatible shapes with equivalent ops that operate on
+    compatible shapes directly. This simplifies conversion to EmitC.
 }];
 }
 
