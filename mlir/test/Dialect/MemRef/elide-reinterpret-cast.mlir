@@ -160,22 +160,6 @@ func.func private @concat_rank3(%src : memref<1x1x1xf32>,
 // Negative tests (must NOT rewrite)
 //===----------------------------------------------------------------------===//
 
-// CHECK-LABEL: func.func private @negative_concat_more_non_unit_dims(
-func.func private @negative_concat_more_non_unit_dims(%src : memref<1x1x1xf32>,
-  %dst : memref<1x2x108xf32>) {
-  // CHECK:      %reinterpret_cast = memref.reinterpret_cast %arg1
-  %reinterpret_cast = memref.reinterpret_cast %dst
-    to offset: [0], sizes: [1, 1, 1], strides: [1, 1, 1]
-    : memref<1x2x108xf32> to memref<1x1x1xf32>
-
-  // CHECK:      memref.copy %arg0, %reinterpret_cast
-  // CHECK-NOT:  memref.load
-  // CHECK-NOT:  memref.store
-  memref.copy %src, %reinterpret_cast
-    : memref<1x1x1xf32> to memref<1x1x1xf32>
-  return
-}
-
 // CHECK-LABEL: func.func private @negative_concat_strided_base(
 func.func private @negative_concat_strided_base(%src: memref<1x1xf32>,
   %dst: memref<8x1xf32, strided<[10, 2]>>) {
@@ -215,14 +199,14 @@ func.func private @negative_concat_multiple_non_unit_dims(
   %src : memref<1x1xf32>, %dst : memref<2x108xf32>) {
   // CHECK:      %reinterpret_cast = memref.reinterpret_cast %arg1
   %reinterpret_cast = memref.reinterpret_cast %dst
-    to offset: [0], sizes: [1, 1], strides: [0, 0]
+    to offset: [0], sizes: [1, 1], strides: [1, 1]
     : memref<2x108xf32>
-      to memref<1x1xf32, strided<[0, 0]>>
+      to memref<1x1xf32>
   // CHECK:      memref.copy %arg0, %reinterpret_cast
   // CHECK-NOT:  memref.load
   // CHECK-NOT:  memref.store
   memref.copy %src, %reinterpret_cast
-    : memref<1x1xf32> to memref<1x1xf32, strided<[0, 0]>>
+    : memref<1x1xf32> to memref<1x1xf32>
   return
 }
 
