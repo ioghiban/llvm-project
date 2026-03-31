@@ -16,6 +16,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/Repeated.h"
 #include <cassert>
+#include <optional>
 
 namespace mlir {
 namespace memref {
@@ -199,147 +200,164 @@ public:
 
 static bool isConstZero(Value v) { return matchPattern(v, m_Zero()); }
 
-static bool isPureRankReshape(memref::ReinterpretCastOp rc, memref::LoadOp op) {
+static std::optional<int64_t> getConstantIndex(Value v) {
+  if (auto cst = v.getDefiningOp<arith::ConstantIndexOp>())
+    return cst.value();
+  return std::nullopt;
+}
+
+struct SingleNonUnitDimInfo {
+  bool Exists = false;
+  bool isOnLeft = true;
+  bool isOnRight = true;
+};
+
+/// Returns information about a MemRef with at most one non-unit dimension.
+///
+/// The single non-unit dimension, if present, must be on the left or right
+/// boundary. Rank-1 non-unit memrefs are treated as being on both boundaries.
+static std::optional<SingleNonUnitDimInfo>
+getSingleNonUnitDimInfo(MemRefType type) {
+  ArrayRef<int64_t> shape = type.getShape();
+  int64_t nonUnitCount =
+      llvm::count_if(shape, [](int64_t dim) { return dim != 1; });
+  if (nonUnitCount == 0)
+    return SingleNonUnitDimInfo{};
+  if (nonUnitCount > 1)
+    return std::nullopt;
+
+  bool isOnLeft = shape.front() != 1;
+  bool isOnRight = shape.back() != 1;
+  if (!isOnLeft && !isOnRight)
+    return std::nullopt;
+
+  return SingleNonUnitDimInfo{/*Exists=*/true, isOnLeft, isOnRight};
+}
+
+static bool hasStaticZeroOffset(memref::ReinterpretCastOp rc) {
+  ArrayRef<int64_t> offsets = rc.getStaticOffsets();
+  // FIXME: Despite what `getStaticOffsets` implies, `reinterpret_cast` takes
+  // only a single offset. That should be fixed at the op definition level.
+  return offsets.size() == 1 && !ShapedType::isDynamic(offsets[0]) &&
+         offsets[0] == 0;
+}
+
+static bool isConstantIndexInBounds(Value idx, int64_t upperBound) {
+  if (isConstZero(idx))
+    return true;
+
+  std::optional<int64_t> idxVal = getConstantIndex(idx);
+  return idxVal && *idxVal >= 0 && *idxVal < upperBound;
+}
+
+/// Checks for pure rank expansion/collapsing of a single logical dimension:
+///   - all metadata is static
+///   - offset is 0
+///   - source/result each have at most one non-unit dim
+///   - if a non-unit dim exists, it is at the left or right boundary
+///
+/// Examples accepted by this shape restriction:
+///   memref<999xf32>       <-> memref<1x1x999xf32>
+///   memref<1x108xf32>     <-> memref<1x1x1x108xf32>
+///   memref<100x1xf32>     <-> memref<100x1x1xf32>
+///   memref<1>             <-> memref<1x1x1>
+///
+/// General reinterpret_casts are intentionally rejected.
+static bool isPureRankExpansionOrCollapsingRC(memref::ReinterpretCastOp rc) {
   auto inputTy = cast<MemRefType>(rc.getSource().getType());
   auto outputTy = cast<MemRefType>(rc.getResult().getType());
 
-  // This fold only handles reinterpret_casts that behave like pure rank
-  // reshapes of a single logical dimension:
-  //
-  //   - all metadata is static
-  //   - offset is 0
-  //   - source/result each have at most one non-unit dim
-  //   - if a non-unit dim exists, it is at the left or right boundary
-  //
-  // Examples accepted by this shape restriction:
-  //   memref<999xf32>       <-> memref<1x1x999xf32>
-  //   memref<1x108xf32>     <-> memref<1x1x1x108xf32>
-  //   memref<100x1xf32>     <-> memref<100x1x1xf32>
-  //
-  // General reinterpret_casts are intentionally rejected.
-
-  auto offsets = rc.getStaticOffsets();
-  assert(offsets.size() == 1 && "Expecting single offset");
-
-  // The rewrite drops the reinterpret_cast and remaps indices directly to the
-  // source memref. That is only correct if there is no storage shift.
-  if (ShapedType::isDynamic(offsets[0]) || offsets[0] != 0)
+  // This check assumes the rewrite relies on "index re-use" and misses "index
+  // re-write/adjustment". Thus, storage shift and statically unknown offsets
+  // are rejected.
+  if (!hasStaticZeroOffset(rc))
     return false;
 
-  auto sizes = rc.getStaticSizes();
-  auto strides = rc.getStaticStrides();
-
-  // Require fully static metadata. The fold relies on knowing exactly which
-  // dimensions are unit dimensions and which indices may be ignored.
-  if (llvm::any_of(sizes, ShapedType::isDynamic))
-    return false;
-  if (llvm::any_of(strides, ShapedType::isDynamic))
+  // The check assumes the rewrite relies on completely static shape info.
+  if (llvm::any_of(rc.getStaticSizes(), ShapedType::isDynamic) ||
+      llvm::any_of(rc.getStaticStrides(), ShapedType::isDynamic))
     return false;
 
-  // Count non-unit dims and remember their positions.
-  //
-  // The rewrite supports shapes with at most one non-unit dimension.
-  // This excludes underlying multi-dimensional layouts and keeps the
-  // fold limited to unit-dim insertion/removal reshapes.
-  unsigned inputRank = inputTy.getRank();
-  int inputNonUnitCount = 0;
-  int64_t inputNonUnitSize = 1;
-  unsigned inputNonUnitPos = 0;
-  for (unsigned i = 0; i < inputRank; ++i) {
-    if (inputTy.getDimSize(i) != 1) {
-      ++inputNonUnitCount;
-      inputNonUnitPos = i;
-      inputNonUnitSize = inputTy.getDimSize(i);
-    }
-  }
-
-  unsigned outputRank = outputTy.getRank();
-  int outputNonUnitCount = 0;
-  int64_t outputNonUnitSize = 1;
-  unsigned outputNonUnitPos = 0;
-  for (unsigned i = 0; i < outputRank; ++i) {
-    if (outputTy.getDimSize(i) != 1) {
-      ++outputNonUnitCount;
-      outputNonUnitPos = i;
-      outputNonUnitSize = outputTy.getDimSize(i);
-    }
-  }
-
-  // Reject reshapes with > 1 non-unit-dimension.
-  //
-  // The source and result must have the same number of non-unit dimensions:
-  // either both are all-ones, or both have exactly one non-unit dimension.
-  if (inputNonUnitCount > 1 || outputNonUnitCount > 1 ||
-      inputNonUnitCount != outputNonUnitCount)
+  // The check assumes the rewrite supports shapes with at most one non-unit
+  // dimension. This excludes underlying multi-dimensional layouts and keeps the
+  // rewrite limited to unit-dim insertion/removal `reinterpret_cast`s.
+  std::optional<SingleNonUnitDimInfo> inputNonUnitDim =
+      getSingleNonUnitDimInfo(inputTy);
+  std::optional<SingleNonUnitDimInfo> outputNonUnitDim =
+      getSingleNonUnitDimInfo(outputTy);
+  if (!inputNonUnitDim || !outputNonUnitDim)
     return false;
 
-  // If there is a non-unit dimension, it must live at the same boundary
-  // (first or last dimension) on both input and output memrefs.
-  // The rewrite logic for preserving the load index is exclusive to these
-  // cases.
-  if (inputNonUnitCount == 1) {
-    auto isBoundary = [](unsigned pos, unsigned rank) {
-      return pos == 0 || pos == rank - 1;
-    };
-    if (!isBoundary(inputNonUnitPos, inputRank) ||
-        !isBoundary(outputNonUnitPos, outputRank))
-      return false;
-  }
-
-  // Size of non-unit dimension must be the same
-  if (inputNonUnitCount == 1 && outputNonUnitCount == 1 &&
-      inputNonUnitSize != outputNonUnitSize)
+  // The source and result must either both be all-ones, or both have a single
+  // non-unit dimension.
+  if (inputNonUnitDim->Exists != outputNonUnitDim->Exists)
     return false;
+  if (!inputNonUnitDim->Exists)
+    return true;
 
-  SmallVector<Value> idxs(op.getIndices().begin(), op.getIndices().end());
-  SmallVector<unsigned> nonZeroIdxPositions;
-  nonZeroIdxPositions.reserve(idxs.size());
-
-  // Record non-zero indices.
-  //
-  // During rank expansion, the rewrite drops the extra unit-dimension indices.
-  // That is only semantics-preserving if every dropped index is zero.
-  for (auto [pos, idx] : llvm::enumerate(idxs)) {
-    if (!isConstZero(idx))
-      nonZeroIdxPositions.push_back(pos);
-  }
-
-  // Position of the unique non-unit dim in the output, if present:
-  //   - 0            for shapes like [N, 1, 1]
-  //   - outputRank-1 for shapes like [1, 1, N]
-  //
-  // For the all-ones case, treat it like the "non-unit on the right" case.
-  unsigned nonUnitDimPos =
-      (outputNonUnitCount == 1 && outputTy.getDimSize(0) != 1) ? 0
-                                                               : outputRank - 1;
-
-  if (outputRank >= inputRank) {
-    // Rank expansion case.
-    //
-    // The rewrite keeps only inputRank indices. Any non-zero index in an
-    // expanded unit dimension that would be discarded makes the fold invalid.
-    if (nonUnitDimPos == 0) {
-      // Expansion on the right: keep the leftmost inputRank indices.
-      // Therefore any non-zero index in the suffix would be lost.
-      for (unsigned pos : nonZeroIdxPositions) {
-        if (pos >= inputRank)
-          return false;
-      }
-    } else {
-      // Expansion on the left: keep the rightmost inputRank indices.
-      // Therefore any non-zero index in the prefix would be lost.
-      unsigned firstValidPos = outputRank - inputRank;
-      for (unsigned pos : nonZeroIdxPositions) {
-        if (pos < firstValidPos)
-          return false;
-      }
-    }
-  }
-
-  return true;
+  // If there is a non-unit dimension, it must be preserved on the same
+  // boundary. Rank-1 memrefs are accepted against either boundary.
+  return (inputNonUnitDim->isOnLeft && outputNonUnitDim->isOnLeft) ||
+         (inputNonUnitDim->isOnRight && outputNonUnitDim->isOnRight);
 }
 
-struct FoldReinterpretCastLoad : public OpRewritePattern<memref::LoadOp> {
+/// Checks whether load indices corresponding to unit dims in the source
+/// MemRef are all 0, i.e. in-bounds.
+/// Returns false for out-of-bounds indices or non-constant indices.
+static bool areIndicesForUnitDimsInBounds(memref::LoadOp load) {
+  auto rc = load.getMemRef().getDefiningOp<memref::ReinterpretCastOp>();
+  auto rcInputTy = cast<MemRefType>(rc.getSource().getType());
+  auto rcOutputTy = cast<MemRefType>(rc.getResult().getType());
+  int64_t rcInputRank = rcInputTy.getRank();
+  int64_t rcOutputRank = rcOutputTy.getRank();
+
+  std::optional<SingleNonUnitDimInfo> inputNonUnitDim =
+      getSingleNonUnitDimInfo(rcInputTy);
+  std::optional<SingleNonUnitDimInfo> outputNonUnitDim =
+      getSingleNonUnitDimInfo(rcOutputTy);
+  if (!inputNonUnitDim || !outputNonUnitDim)
+    return false;
+
+  SmallVector<unsigned> nonZeroIdxPositions;
+  nonZeroIdxPositions.reserve(load.getIndices().size());
+
+  // Check if non-zero indices are out-of-bounds.
+  // Only care about indices corresponding to the load from the
+  // reinterpret_cast result.
+  for (auto [pos, idx] : llvm::enumerate(load.getIndices())) {
+    if (isConstZero(idx))
+      continue;
+
+    // Bail out early for the all-ones case.
+    if (!inputNonUnitDim->Exists)
+      return false;
+
+    // FIXME: This should be ensured by the memref.load semantics.
+    if (!isConstantIndexInBounds(idx, rcOutputTy.getDimSize(pos)))
+      return false;
+
+    nonZeroIdxPositions.push_back(pos);
+  }
+
+  // During rank expansion, the rewrite drops the extra unit-dimension indices.
+  // That is only semantics-preserving if every dropped index is zero.
+  // This check is only relevant for expansions with a non-unit dimension.
+  if (rcOutputRank < rcInputRank || !inputNonUnitDim->Exists)
+    return true;
+
+  // The rewrite keeps either a prefix or suffix of length `rcInputRank`.
+  // Any non-zero index outside the preserved slice would be discarded.
+  if (outputNonUnitDim->isOnLeft)
+    return llvm::none_of(nonZeroIdxPositions,
+                         [&](unsigned pos) { return pos >= rcInputRank; });
+
+  unsigned firstKeptPos = rcOutputRank - rcInputRank;
+  return llvm::none_of(nonZeroIdxPositions,
+                       [&](unsigned pos) { return pos < firstKeptPos; });
+}
+
+struct RewriteLoadFromReinterpretCast
+    : public OpRewritePattern<memref::LoadOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
 
@@ -349,9 +367,11 @@ public:
     if (!rc)
       return failure();
 
-    // This fold is only correct for the narrow "pure rank reshape of a single
-    // logical dimension" cases accepted by isPureRankReshape().
-    if (!isPureRankReshape(rc, op))
+    // This rewrite is only correct for the narrow "pure rank expansion or
+    // collapsing of a single logical dimension" cases accepted by these two
+    // checks.
+    if (!isPureRankExpansionOrCollapsingRC(rc) ||
+        !areIndicesForUnitDimsInBounds(op))
       return failure();
 
     auto rcOutputTy = cast<MemRefType>(rc.getResult().getType());
@@ -362,46 +382,51 @@ public:
 
     SmallVector<Value> idxs(op.getIndices().begin(), op.getIndices().end());
     SmallVector<Value> rcInputIdxs;
+    rcInputIdxs.reserve(rcInputRank);
 
-    // The fold only supports reshapes with at most one non-unit dimension,
-    // located at the left or right boundary.
+    // The rewrite only supports reinterpret_casts with at most one non-unit
+    // dimension, located at the left or right boundary.
     //
-    // The higher-rank side tells which side the reshape has expanded/collapsed.
+    // The higher-rank side tells which side the reinterpret_cast has
+    // expanded/collapsed.
     //
     //   expansion: rcOutput has the higher rank
-    //   collapse : rcInput has the higher rank
+    //   collapsing : rcInput has the higher rank
     //
     // Example:
     //   memref<999>     -> memref<1x1x999>   : extra dims to the left
     //   memref<999x1x1> -> memref<999>       : extra dims to the right
     MemRefType expandedTy =
         rcOutputRank >= rcInputRank ? rcOutputTy : rcInputTy;
-    bool nonUnitOnLeft = expandedTy.getDimSize(0) != 1;
+    std::optional<SingleNonUnitDimInfo> expandedNonUnitDim =
+        getSingleNonUnitDimInfo(expandedTy);
+    assert(expandedNonUnitDim && "expected a single boundary non-unit dim");
+    bool keepLeadingIndices = expandedNonUnitDim->isOnLeft;
 
     if (rcOutputRank >= rcInputRank) {
       // Rank expansion:
-      //   memref<N>   -> memref<1x1xN>   : keep the last rcInputRank indices
-      //   memref<N>   -> memref<Nx1x1>   : keep the first rcInputRank indices
+      //   memref<N>     -> memref<1x1xN> : keep the last rcInputRank indices
+      //   memref<N>     -> memref<Nx1x1> : keep the first rcInputRank indices
+      //   memref<1>     -> memref<1x1x1> : all indices are zero
       //
-      // Any discarded indices are known to be zero from isPureRankReshape().
-      if (nonUnitOnLeft) {
-        for (int64_t dim = 0; dim < rcInputRank; ++dim)
-          rcInputIdxs.push_back(idxs[dim]);
-      } else {
-        for (int64_t dim = 0; dim < rcInputRank; ++dim)
-          rcInputIdxs.push_back(idxs[rcOutputRank - rcInputRank + dim]);
-      }
+      // Any discarded indices are known to be zero from
+      // areIndicesForUnitDimsInBounds().
+      int64_t firstKeptPos =
+          keepLeadingIndices ? 0 : rcOutputRank - rcInputRank;
+      rcInputIdxs.append(idxs.begin() + firstKeptPos,
+                         idxs.begin() + firstKeptPos + rcInputRank);
     } else {
-      // Rank collapse:
-      //   memref<1x1xN> -> memref<N>      : reinsert leading zeros
-      //   memref<Nx1x1> -> memref<N>      : reinsert trailing zeros
+      // Rank collapsing:
+      //   memref<1x1xN> -> memref<N>     : reinsert leading zeros
+      //   memref<Nx1x1> -> memref<N>     : reinsert trailing zeros
+      //   memref<1x1x1> -> memref<1>     : all indices are zero
       //
-      // The collapsed-away dimensions are unit dims, so readding them with
+      // The collapsed-away dimensions are unit dims, so re-adding them with
       // zero indices preserves semantics.
       Value c0 = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
       int64_t rankDiff = rcInputRank - rcOutputRank;
 
-      if (nonUnitOnLeft) {
+      if (keepLeadingIndices) {
         rcInputIdxs.append(idxs.begin(), idxs.end());
         rcInputIdxs.append(rankDiff, c0);
       } else {
@@ -410,10 +435,8 @@ public:
       }
     }
 
-    // Sanity check: rewritten load must index the source memref with exactly
-    // as many indices as the rank.
-    if ((int64_t)rcInputIdxs.size() != rcInputRank)
-      return failure();
+    assert(rcInputIdxs.size() == static_cast<size_t>(rcInputRank) &&
+           "Incorrect number of indices!");
 
     auto rcInput = rc.getSource();
     // If the only user of rc is the current Op (which is about to be erased),
@@ -447,7 +470,8 @@ struct ElideReinterpretCastPass
       auto rc = op.getMemRef().getDefiningOp<memref::ReinterpretCastOp>();
       if (!rc)
         return true;
-      return !isPureRankReshape(rc, op);
+      return !(isPureRankExpansionOrCollapsingRC(rc) &&
+               areIndicesForUnitDimsInBounds(op));
     });
     target.addLegalDialect<arith::ArithDialect, memref::MemRefDialect>();
     if (failed(applyPartialConversion(getOperation(), target,
@@ -460,6 +484,6 @@ struct ElideReinterpretCastPass
 
 void mlir::memref::populateElideReinterpretCastPatterns(
     RewritePatternSet &patterns) {
-  patterns.add<CopyToScalarLoadAndStore, FoldReinterpretCastLoad>(
+  patterns.add<CopyToScalarLoadAndStore, RewriteLoadFromReinterpretCast>(
       patterns.getContext());
 }
