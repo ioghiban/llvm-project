@@ -7,14 +7,9 @@
 /// `test/Conversion/ArithToEmitC/arith-to-emitc.mlir`; this test only covers
 /// that the combination of the two produces the expected EmitC ops.
 
-/// Vector cases excluded because `arith.maximumf`/`arith.minimumf` expansion
-/// introduces `arith.cmpf`, and ArithToEmitC cannot convert `VectorType`.
-/// i.e. operand conversion for `vector<...>` fails before `cmpf` lowering.
-
-/// Tensor cases excluded because `arith.maximumf`/`arith.minimumf` expansion
-/// introduces `arith.cmpf`, but ArithToEmitC only lowers scalar `cmpf`.
-/// i.e. `cmpf` rejects tensors with: "only supported on floats, not
-/// tensors/vectors thereof".
+/// `arith.maximumf`/`arith.minimumf` expand through `arith.cmpf`.
+/// Vector cases excluded because ArithToEmitC cannot convert `VectorType`.
+/// Tensor cases excluded because ArithToEmitC only lowers scalar `cmpf`.
 
 // CHECK-LABEL: func @maximumf
 // CHECK-SAME:  %[[ARG0:.*]]: f32, %[[ARG1:.*]]: f32) -> f32
