@@ -222,14 +222,13 @@ getShapeInfoFor1DMemRef(MemRefType type) {
   ArrayRef<int64_t> shape = type.getShape();
   int64_t nonUnitCount =
       llvm::count_if(shape, [](int64_t dim) { return dim != 1; });
-  // Return default values if missing nonUnitDim
+  // Return default values if missing non-unit dimension (all-ones MemRef).
   if (nonUnitCount == 0)
     return ShapeInfoFor1DMemRef{};
-  // Return no info if MemRef breaks nonUnitDim requirements (more nonUnitDims)
+  // Return no info if MemRef has more non-unit dimensions.
   if (nonUnitCount > 1)
     return std::nullopt;
-  // Return no info if MemRef breaks nonUnitDim requirements (nonUnitDim in
-  // non-boundary pos)
+  // Return no info if MemRef has non-unit dimension in non-boundary positions.
   if (shape.front() == 1 && shape.back() == 1)
     return std::nullopt;
 
@@ -252,6 +251,9 @@ static std::optional<int64_t> getConstantIndex(Value v) {
   return std::nullopt;
 }
 
+/// Return true if input index is in bounds, i.e. `0 <= idx < upperBound`.
+/// Fully dynamic index values (i.e. non-constant) that cannot be analysed are
+/// treated as in-bounds.
 static bool isConstantIndexExplicitlyOutOfBounds(Value idx,
                                                  int64_t upperBound) {
   // Only statically known `arith.constant` indices are checked here.
@@ -318,9 +320,9 @@ static bool isPureRankExpansionOrCollapsingRC(memref::ReinterpretCastOp rc) {
   return true;
 }
 
-/// Checks statically known indices accessed by a load from a pure rank
-/// expansion/collapsing to ensure in-bounds only access. Dynamic indices are
-/// accepted.
+/// Checks statically known and constant indices accessed by a load from a pure
+/// rank expansion/collapsing to ensure in-bounds only access. Fully dynamic
+/// indices are skipped (there is no way to verify them).
 static bool areIndicesInBounds(memref::LoadOp load) {
   auto rc = load.getMemRef().getDefiningOp<memref::ReinterpretCastOp>();
   auto rcOutputTy = cast<MemRefType>(rc.getResult().getType());

@@ -504,9 +504,25 @@ func.func private @negative_inner_non_unit_dims(
   return
 }
 
-// CHECK-LABEL: func.func private @negative_diff_non_unit_dims(
+// CHECK-LABEL: func.func private @negative_diff_non_unit_boundary(
 // CHECK-SAME:    %[[SRC:.*]]: memref<1x1x1x100xf32>) {
-func.func private @negative_diff_non_unit_dims(
+func.func private @negative_diff_non_unit_boundary(
+    %src : memref<1x1x1x100xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  // CHECK:       %[[RC:.*]] = memref.reinterpret_cast %[[SRC]]
+  %reinterpret_cast = memref.reinterpret_cast %src
+    to offset: [0], sizes: [100, 1, 1], strides: [1, 100, 100]
+    : memref<1x1x1x100xf32> to memref<100x1x1xf32, strided<[1, 100, 100]>>
+  // CHECK:       memref.load %[[RC]]
+  %0 = memref.load %reinterpret_cast[%c1, %c0, %c0] : memref<100x1x1xf32,
+    strided<[1, 100, 100]>>
+  return
+}
+
+// CHECK-LABEL: func.func private @negative_diff_non_unit_size(
+// CHECK-SAME:    %[[SRC:.*]]: memref<1x1x1x100xf32>) {
+func.func private @negative_diff_non_unit_size(
     %src : memref<1x1x1x100xf32>) {
   %c0 = arith.constant 0 : index
   %c98 = arith.constant 98 : index
