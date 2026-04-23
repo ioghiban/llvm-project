@@ -198,19 +198,18 @@ public:
   }
 };
 
-/// Describes the unique non-unit dimension of a MemRef shape.
+/// Captures info about MemRefs that are effectively 1D (the leading or trailing
+/// dims are all 1). The only accepted non-unit dim is either the leading of the
+/// trailing dim.
 ///
-/// This helper is only used for shapes that have at most one non-unit
-/// dimension. `exists` is false for all-ones shapes. Otherwise, `isOnLeft`
-/// indicates whether the non-unit dimension is on the left boundary.
+/// Examples:
+/// memref<1x1x4xf32>, memref<4x1x1xf32>, memref<1x1x1xf32>
 ///
-/// If `exists` is true and `isOnLeft` is false, the non-unit dimension is on
-/// the right boundary. Rank-1 non-unit MemRefs are treated as matching both
-/// boundaries and callers that care about the right boundary must account for
-/// that from the MemRef type.
-struct SingleNonUnitDimInfo {
-  bool exists = false;
-  bool isOnLeft = false;
+struct ShapeInfoFor1DMemRef {
+  // Are all dims == 1? `false` means that there is exactly one dim != 1.
+  bool allOnes = true;
+  // If there is a non-unit boundary dim, is it the leading or the trailing dim?
+  bool isLeadingDimNonUnit = false;
 };
 
 /// Returns information about a MemRef if it contains at most one non-unit
@@ -218,25 +217,24 @@ struct SingleNonUnitDimInfo {
 ///
 /// The single non-unit dimension, if present, must be on the left or right
 /// boundary. Rank-1 non-unit MemRefs are treated as being on both boundaries.
-static std::optional<SingleNonUnitDimInfo>
-getSingleNonUnitDimInfo(MemRefType type) {
+static std::optional<ShapeInfoFor1DMemRef>
+getShapeInfoFor1DMemRef(MemRefType type) {
   ArrayRef<int64_t> shape = type.getShape();
   int64_t nonUnitCount =
       llvm::count_if(shape, [](int64_t dim) { return dim != 1; });
   // Return default values if missing nonUnitDim
   if (nonUnitCount == 0)
-    return SingleNonUnitDimInfo{};
+    return ShapeInfoFor1DMemRef{};
   // Return no info if MemRef breaks nonUnitDim requirements (more nonUnitDims)
   if (nonUnitCount > 1)
     return std::nullopt;
-
-  bool isOnLeft = shape.front() != 1;
   // Return no info if MemRef breaks nonUnitDim requirements (nonUnitDim in
   // non-boundary pos)
-  if (!isOnLeft && shape.back() == 1)
+  if (shape.front() == 1 && shape.back() == 1)
     return std::nullopt;
 
-  return SingleNonUnitDimInfo{/*exists=*/true, isOnLeft};
+  return ShapeInfoFor1DMemRef{/*allOnes=*/false,
+                              /*isLeadingDimNonUnit=*/shape.front() != 1};
 }
 
 static bool hasStaticZeroOffset(memref::ReinterpretCastOp rc) {
@@ -250,11 +248,13 @@ static bool hasStaticZeroOffset(memref::ReinterpretCastOp rc) {
 static std::optional<int64_t> getConstantIndex(Value v) {
   if (auto cst = v.getDefiningOp<arith::ConstantIndexOp>())
     return cst.value();
+  // Non-constant and dynamic indices
   return std::nullopt;
 }
 
 static bool isConstantIndexExplicitlyOutOfBounds(Value idx,
                                                  int64_t upperBound) {
+  // Only statically known `arith.constant` indices are checked here.
   std::optional<int64_t> idxVal = getConstantIndex(idx);
   return idxVal && (*idxVal < 0 || *idxVal >= upperBound);
 }
@@ -270,46 +270,49 @@ static bool isPureRankExpansionOrCollapsingRC(memref::ReinterpretCastOp rc) {
   auto inputTy = cast<MemRefType>(rc.getSource().getType());
   auto outputTy = cast<MemRefType>(rc.getResult().getType());
 
-  // This rewrite assumes "index re-use" and misses "index
-  // re-write/adjustment" logic, hence the requirement for the offset to be 0.
-  // Thus, storage shift and statically unknown offsets are rejected.
+  // Only zero, statically known offsets are accepted. Non-zero or dynamic
+  // offsets would require reasoning about storage shifts in the underlying
+  // reinterpret_cast, which this helper does not model.
   if (!hasStaticZeroOffset(rc))
     return false;
 
-  // The check assumes the rewrite relies on completely static shape info.
+  // Dynamic sizes/strides prevent precise reasoning about the underlying
+  // reinterpret_cast, so only fully static shape metadata is accepted.
   if (llvm::any_of(rc.getStaticSizes(), ShapedType::isDynamic) ||
       llvm::any_of(rc.getStaticStrides(), ShapedType::isDynamic))
     return false;
 
-  // The check assumes the rewrite supports shapes with at most one non-unit
-  // dimension. This excludes underlying multi-dimensional layouts and keeps the
-  // rewrite limited to unit-dim insertion/removal `reinterpret_cast`s.
-  std::optional<SingleNonUnitDimInfo> inputNonUnitDim =
-      getSingleNonUnitDimInfo(inputTy);
-  std::optional<SingleNonUnitDimInfo> outputNonUnitDim =
-      getSingleNonUnitDimInfo(outputTy);
-  // Bail out early if nonUnitDims don't follow rewrite assumptions.
+  // Only shapes with at most one non-unit dimension are accepted. This rules
+  // out more general multi-dimensional reinterpret_casts and restricts the
+  // helper to unit-dim insertion/removal around a single logical dimension.
+  std::optional<ShapeInfoFor1DMemRef> inputNonUnitDim =
+      getShapeInfoFor1DMemRef(inputTy);
+  std::optional<ShapeInfoFor1DMemRef> outputNonUnitDim =
+      getShapeInfoFor1DMemRef(outputTy);
+  // Bail out if either type does not satisfy the single-boundary-non-unit-dim
+  // restriction described above.
   if (!inputNonUnitDim || !outputNonUnitDim)
     return false;
 
   // The source and result must either both have a single non-unit dimension
   // or both be all-ones.
-  if (inputNonUnitDim->exists != outputNonUnitDim->exists)
+  if (inputNonUnitDim->allOnes != outputNonUnitDim->allOnes)
     return false;
-  if (!inputNonUnitDim->exists)
+  if (inputNonUnitDim->allOnes)
     return true;
 
   // The preserved non-unit dimension must have the same size.
-  if (inputTy.getDimSize(inputNonUnitDim->isOnLeft ? 0
-                                                   : inputTy.getRank() - 1) !=
-      outputTy.getDimSize(outputNonUnitDim->isOnLeft ? 0
-                                                     : outputTy.getRank() - 1))
+  if (inputTy.getDimSize(
+          inputNonUnitDim->isLeadingDimNonUnit ? 0 : inputTy.getRank() - 1) !=
+      outputTy.getDimSize(
+          outputNonUnitDim->isLeadingDimNonUnit ? 0 : outputTy.getRank() - 1))
     return false;
 
   // If both sides have rank > 1, the non-unit dimension must be on the same
   // boundary. Rank-1 MemRefs are accepted against either boundary.
   if (inputTy.getRank() != 1 && outputTy.getRank() != 1 &&
-      inputNonUnitDim->isOnLeft != outputNonUnitDim->isOnLeft)
+      inputNonUnitDim->isLeadingDimNonUnit !=
+          outputNonUnitDim->isLeadingDimNonUnit)
     return false;
 
   return true;
@@ -324,12 +327,37 @@ static bool areIndicesInBounds(memref::LoadOp load) {
 
   for (auto [pos, idx] : llvm::enumerate(load.getIndices())) {
     // FIXME: This should be ensured by the memref.load semantics.
+    // In the long term, this sanity-check may live in the same debug-only
+    // checks as `MLIR_ENABLE_EXPENSIVE_PATTERN_API_CHECKS`. This rejects
+    // only explicit constant OOB indices. Dynamic/non-constant indices are not
+    // filtered here.
     if (isConstantIndexExplicitlyOutOfBounds(idx, rcOutputTy.getDimSize(pos)))
       return false;
   }
   return true;
 }
 
+/// Rewrites `memref.load` through a pure rank-only `reinterpret_cast` by
+/// mapping the load indices directly onto the source MemRef.
+
+/// Shape restriction gated by isPureRankExpansionOrCollapsingRC().
+///
+/// BEFORE (rank expansion)
+///   %view = memref.reinterpret_cast %src
+///     : memref<Nxf32> to memref<1x1xNxf32>
+///   %v = memref.load %view[%c0, %c0, %i] : memref<1x1xNxf32>
+///
+/// AFTER
+///   %v = memref.load %src[%i] : memref<Nxf32>
+///
+/// BEFORE (rank collapsing)
+///   %view = memref.reinterpret_cast %src
+///     : memref<1x1xNxf32> to memref<Nxf32>
+///   %v = memref.load %view[%i] : memref<Nxf32>
+///
+/// AFTER
+///   %c0 = arith.constant 0 : index
+///   %v = memref.load %src[%c0, %c0, %i] : memref<1x1xNxf32>
 struct RewriteLoadFromReinterpretCast
     : public OpRewritePattern<memref::LoadOp> {
 public:
@@ -369,14 +397,14 @@ public:
     //   collapsing : rcInput has the higher rank
     //
     // Example:
-    //   memref<999>     -> memref<1x1x999>   : extra dims to the left
-    //   memref<999x1x1> -> memref<999>       : extra dims to the right
+    //   memref<999>     -> memref<1x1x999>   : leading extra dims
+    //   memref<999x1x1> -> memref<999>       : trailing extra dims
     MemRefType expandedTy =
         rcOutputRank >= rcInputRank ? rcOutputTy : rcInputTy;
-    std::optional<SingleNonUnitDimInfo> expandedNonUnitDim =
-        getSingleNonUnitDimInfo(expandedTy);
+    std::optional<ShapeInfoFor1DMemRef> expandedNonUnitDim =
+        getShapeInfoFor1DMemRef(expandedTy);
     assert(expandedNonUnitDim && "expected a single boundary non-unit dim");
-    bool keepLeadingIndices = expandedNonUnitDim->isOnLeft;
+    bool keepLeadingIndices = expandedNonUnitDim->isLeadingDimNonUnit;
 
     if (rcOutputRank >= rcInputRank) {
       // Rank expansion:
@@ -419,9 +447,6 @@ public:
     if (rc.getResult().hasOneUse())
       rewriter.eraseOp(rc);
     rewriter.replaceOpWithNewOp<memref::LoadOp>(op, rcInput, rcInputIdxs);
-
-    // Do not erase the reinterpret_cast here. After the load is rewritten it
-    // may become dead, and canonical DCE can remove it.
     return success();
   }
 };
