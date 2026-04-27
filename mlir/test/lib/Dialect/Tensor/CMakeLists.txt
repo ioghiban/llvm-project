@@ -6,6 +6,7 @@ add_mlir_library(MLIRTensorTestPasses
   )
 mlir_target_link_libraries(MLIRTensorTestPasses PUBLIC
   MLIRArithDialect
+  MLIRFuncDialect
   MLIRLinalgDialect
   MLIRPass
   MLIRSCFDialect

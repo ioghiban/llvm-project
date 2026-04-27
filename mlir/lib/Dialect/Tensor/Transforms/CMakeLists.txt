@@ -9,6 +9,7 @@ add_mlir_dialect_library(MLIRTensorTransforms
   ReshapePatterns.cpp
   RewriteAsConstant.cpp
   RuntimeOpVerification.cpp
+  ScalarizeFunctionResultPatterns.cpp
   SwapExtractSliceWithProducerPatterns.cpp
   SubsetInsertionOpInterfaceImpl.cpp
 
@@ -25,6 +26,7 @@ add_mlir_dialect_library(MLIRTensorTransforms
   MLIRArithDialect
   MLIRArithUtils
   MLIRDialectUtils
+  MLIRFuncDialect
   MLIRIR
   MLIRLinalgDialect
   MLIRMemRefDialect

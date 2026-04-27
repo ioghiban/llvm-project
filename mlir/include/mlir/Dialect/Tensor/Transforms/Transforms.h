@@ -103,6 +103,13 @@ using ControlFoldFn = std::function<bool(OpOperand *)>;
 void populateRewriteAsConstantPatterns(RewritePatternSet &patterns,
                                        const ControlFoldFn &controlFn);
 
+/// Populates `patterns` with patterns that rewrite a function returning a
+/// single statically shaped tensor with exactly one element into a function
+/// that returns the tensor element type. The function body is updated by
+/// inserting a `tensor.extract` before each `func.return`.
+void populateScalarizeSingleElementTensorReturnPatterns(
+    RewritePatternSet &patterns);
+
 //===----------------------------------------------------------------------===//
 // Transform helpers
 //===----------------------------------------------------------------------===//

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -32,8 +33,8 @@ struct TestTensorTransforms
   TestTensorTransforms(const TestTensorTransforms &pass) : PassWrapper(pass) {}
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, scf::SCFDialect, linalg::LinalgDialect,
-                    transform::TransformDialect>();
+    registry.insert<arith::ArithDialect, func::FuncDialect, scf::SCFDialect,
+                    linalg::LinalgDialect, transform::TransformDialect>();
   }
 
   StringRef getArgument() const final {
@@ -93,6 +94,11 @@ struct TestTensorTransforms
       *this, "test-tracking-listener",
       llvm::cl::desc("Test tensor TrackingListener for the transform dialect"),
       llvm::cl::init(false)};
+
+  Option<bool> testScalarizeSingleElementTensorReturn{
+      *this, "test-scalarize-single-element-tensor-return",
+      llvm::cl::desc("Test scalarization of single-element tensor returns"),
+      llvm::cl::init(false)};
 };
 } // namespace
 
@@ -140,6 +146,12 @@ applyDropRedundantInsertSliceRankExpansionPatterns(Operation *rootOp) {
 static void applyFoldExtractFromCollapseShapePatterns(Operation *rootOp) {
   RewritePatternSet patterns(rootOp->getContext());
   tensor::populateFoldCollapseExtractPatterns(patterns);
+  (void)applyPatternsGreedily(rootOp, std::move(patterns));
+}
+
+static void applyScalarizeSingleElementTensorReturnPatterns(Operation *rootOp) {
+  RewritePatternSet patterns(rootOp->getContext());
+  tensor::populateScalarizeSingleElementTensorReturnPatterns(patterns);
   (void)applyPatternsGreedily(rootOp, std::move(patterns));
 }
 
@@ -394,6 +406,8 @@ void TestTensorTransforms::runOnOperation() {
   }
   if (testFoldExtractFromCollapseShape)
     applyFoldExtractFromCollapseShapePatterns(rootOp);
+  if (testScalarizeSingleElementTensorReturn)
+    applyScalarizeSingleElementTensorReturnPatterns(rootOp);
   if (testTrackingListener)
     if (failed(testTrackingListenerReplacements(rootOp)))
       return signalPassFailure();
